@@ -1,0 +1,1047 @@
+---
+title: "4 Data Analysis NPP Biomes Relatedness and Human Impact"
+output: 
+---
+This is the code used to analyse data for the enemy release literature compilation project.
+
+In this notebook we will test the following hypotheses:
+1.	Enemy release will be stronger in areas of high net primary productivity.
+2.	There will be stronger enemy release observed in tropical ecosystems that are characterised by high productivity.
+3.	Enemy release will also be stronger in areas with higher levels of human influence.
+4. Enemy release will be weaker where there exist many congeners and confamillials to the introduced species
+
+#NPP
+
+##Load Packages / Data
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest) #p-vals for lme4
+library(MuMIn) #Rsquareds for lme4
+library(terra) #for rasters, updated version for both raster and sp
+library(emmeans) #for estimated marginal means
+library(ggpubr) #publication friendly graphs
+
+mypal <- c("#264653", "#2A9D8F", "#E9C46A", "#F4A261", "#E76F51")
+
+```
+
+data
+```{r}
+data_main <- read.csv( "./output/data_main_final.csv")
+```
+ 
+Use terrestrial records only (tried to implement VGPM NPP but it just didn't work well enough in shallow waters).
+
+```{r}
+data_main <- data_main %>% filter(system == "t")
+data_main <- data_main %>% filter(response == "dmg")
+length(unique(data_main$study_species))
+length(unique(data_main$source_filename))
+table(data_main$experiment_type)
+```
+
+Check what data we need
+```{r}
+hist(data_main$time_start)
+
+plot(x = data_main$location_lon, y = data_main$location_lat)
+```
+
+Most of our data is between 2000 and 2018, which we have NPP rasters for, but we will have to use an average for the ones before then.
+
+##Obtain terrestrial NPP data (already coordinate matched from AppEEARS)
+
+Note the following nodata values from MODIS documentation:
+32767 = _Fillvalue
+32766 = land cover assigned as perennial salt or Water bodies
+32765 = land cover assigned as barren,sparse veg (rock,tundra,desert)
+32764 = land cover assigned as perennial snow,ice.
+32763 = land cover assigned as "permanent" wetlands/inundated marshland
+32762 = land cover assigned as urban/built-up
+32761 = land cover assigned as "unclassified" or (not able to determine)
+
+```{r}
+NPP_terra <- read_csv("./data/NPP/Enemy-Release-Records-vs-NPP-MOD17A3HGF-061-results.csv")
+
+NPP_terra$MOD17A3HGF_061_Npp_500m[NPP_terra$MOD17A3HGF_061_Npp_500m %in% c(32767:32761)] <- NA #change nodata values to NA
+
+NPP_terra$Date <- substr(NPP_terra$Date, start = 1, stop = 4)#simplify date into year
+
+NPP_terra <- NPP_terra %>% filter(is.na(MOD17A3HGF_061_Npp_500m) == F) %>% filter(MOD17A3HGF_061_Npp_500m != 0) #filter out NAs and zeros
+
+summary(NPP_terra) #check that the remaining NPP values and their coords look reasonable
+plot(NPP_terra$MOD17A3HGF_061_Npp_500m, NPP_terra$Date) #look for outlying NPP values that might be errors
+
+temp <- NPP_terra %>% group_by(Latitude, Longitude, Date) %>%
+  mutate(mean_is_actual = as.logical(mean(MOD17A3HGF_061_Npp_500m) == MOD17A3HGF_061_Npp_500m), 
+         count = n(),
+         average = mean(MOD17A3HGF_061_Npp_500m)) #find duplicate time*place records
+
+temp %>% filter(mean_is_actual == F) #does NPP vary within these time*place records? no.
+
+#so we can safely just take the first record per group
+NPP_terra <- NPP_terra %>% group_by(Latitude, Longitude, Date) %>% slice_head()
+
+rm(temp)
+
+NPP_terra <- mutate(NPP_terra, .keep = "none",
+                    location_lat = Latitude,
+                    location_lon = Longitude,
+                    time_start = as.integer(Date),
+                    annual_npp = MOD17A3HGF_061_Npp_500m, 
+                    source_npp = "terra") #drop unnecessary columns
+
+NPP_terra <- NPP_terra[, 4:8] #i shouldn't have to do this but remove lat lon and year because mutate doesn't work?
+```
+
+##Use aqua modis NPP to gap fill terra modis
+```{r}
+NPP_aqua <- read_csv("./data/NPP/Enemy-Release-Records-vs-NPP-MYD17A3HGF-061-results.csv") #read
+
+NPP_aqua$MYD17A3HGF_061_Npp_500m[NPP_aqua$MYD17A3HGF_061_Npp_500m %in% c(32767:32761)] <- NA #recognise nullvalues
+
+NPP_aqua$Date <- substr(NPP_aqua$Date, start = 1, stop = 4)#simplify date into year
+
+NPP_aqua <- NPP_aqua %>% filter(is.na(MYD17A3HGF_061_Npp_500m) == F) %>% filter(MYD17A3HGF_061_Npp_500m != 0) #filter out NAs and zeros
+
+NPP_aqua <- NPP_aqua %>% group_by(Latitude, Longitude, Date) %>% slice_head() #slice
+
+NPP_aqua <- mutate(NPP_aqua, .keep = "none",#drop unnecessary columns
+                    location_lat = Latitude,
+                    location_lon = Longitude,
+                    time_start = as.integer(Date),
+                    annual_npp = MYD17A3HGF_061_Npp_500m,
+                   source_npp = "aqua") 
+
+NPP_aqua <- NPP_aqua[, 4:8] #i shouldn't have to do this but remove lat lon and year because mutate doesn't work?#drop uunnecessary cols
+```
+
+
+combine records and remove NAs
+```{r}
+NPP_long <- bind_rows(NPP_aqua, NPP_terra)
+
+NPP_long$source_npp <-as_factor(NPP_long$source_npp) #set source as factor
+
+NPP_long <- NPP_long %>% group_by(location_lat, location_lon, time_start) %>% slice_max(order_by = source_npp) #slice with a preference for terra
+
+NPP_average <- NPP_long %>% 
+  group_by(location_lat, location_lon) %>% 
+  filter(!is.na(annual_npp)) %>% #na.rm didn't seem to work in the summarise so I added it here
+  summarise(avg_npp = mean(annual_npp))
+
+table(NPP_long$source_npp)
+
+rm(NPP_terra, NPP_aqua)
+```
+Ok so aqua only added 2 options that might not make a difference, but I tried.
+
+##Take records between 2001 and 2018 and match them with their corresponding annual NPP
+```{r}
+data_NPP <- data_main
+
+data_NPP$npp_calc <- if_else(condition = data_NPP$time_start %in% c(2001:2018), true = "annual", false = "average") #do we try to use the yearly value or the average value
+
+data_NPP <- left_join(data_NPP, NPP_long, by = c('location_lat', 'location_lon', 'time_start'))
+```
+There should be a load of numbers with a few NAs where the year is not between 2001 and 2018
+
+##Use average when annual NPP isn't available
+```{r}
+data_NPP <- left_join(data_NPP, NPP_average, by = c('location_lat', 'location_lon'))
+```
+
+##clean up
+```{r}
+data_NPP$npp <- if_else(condition = data_NPP$npp_calc == "annual", 
+                         true = data_NPP$annual_npp, 
+                         false = data_NPP$avg_npp)
+
+data_NPP <- data_NPP %>% filter(!is.na(npp))
+
+rm(NPP_average, NPP_long, temp)
+```
+
+##Analysis: ERM * NPP
+```{r}
+data_NPP <- data_NPP %>% filter(response == "dmg") %>% filter(system == "t")
+
+data_NPP_b <- data_NPP %>% filter(data_NPP$experiment_type == "b")
+data_NPP_c <- data_NPP %>% filter(data_NPP$experiment_type == "c")
+```
+
+```{r}
+lm_NPP_b <- lmer(erm ~ npp + species_type + (1|source_filename), data = data_NPP_b)
+
+summary(lm_NPP_b)
+r.squaredGLMM(lm_NPP_b)
+```
+Note that there is a failure to optimise because we have used source_filename (aka study) alongside species_type2 (type of organism) as a random effect even though many studies only look at one type of organism and contribute one contrast to the analysis. This should be ok because the random effects are covering the same general variation between themselves and running without either does not influence the results (as tested below).
+
+```{r}
+rePCA(lm_NPP_b)
+comparison_test <- lm(erm ~ npp, data = data_NPP_b)
+summary(comparison_test)
+```
+
+
+```{r}
+lm_NPP_c <- lmer(erm ~ npp + npp:species_type + (1|source_filename), data = data_NPP_c)
+summary(lm_NPP_c) 
+r.squaredGLMM(lm_NPP_c)
+```
+```{r}
+rePCA(lm_NPP_c)
+comparison_test <- lm(erm ~ npp, data = data_NPP_c)
+summary(comparison_test)
+```
+##Graph
+```{r}
+fig1a <- ggplot(data_NPP_b, aes(x = npp, y = erm)) +
+  geom_point(colour = mypal[2], alpha = 0.6, size = 2)+
+  theme_pubr()+ 
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6), 
+                     limits = c(-4.2,7))+
+  scale_x_continuous(name = "Net Primary Productivity\n") + 
+  theme(axis.title.x = element_text(face="bold"))
+
+fig1b <- ggplot(data_NPP_c, aes(x = npp, y = erm)) +
+  geom_point(colour = mypal[4], alpha = 0.6, size = 2)+
+  theme_pubr()+ 
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6), 
+                     limits = c(-4.2,7))+
+  scale_x_continuous(name = "Net Primary Productivity\n") + 
+  theme(axis.title.x = element_text(face="bold"))
+
+fig1 <- annotate_figure(ggarrange(fig1a+ rremove("ylab"),
+                                 fig1b + rremove("ylab"), 
+                                 labels = c("a)", "b)"), hjust = 0.5),
+                       left = text_grob("Enemy Release Metric\n", rot = 90, face = "bold", size = 14)) 
+
+fig1
+```
+
+
+```{r}
+ggexport(fig1, filename = "./output/ch3 figures/Figure1.tiff",
+         res = 300, width = 2016, height = 1344)
+```
+
+#Biomes
+
+##Load Packages / Data
+```{r}
+#library(devtools)
+#devtools::install_github("valentinitnelav/plotbiomes")
+library(tidyverse)
+library(terra) #rasters
+
+library(emmeans) #estimated marginal means comparisons
+
+library(ggplot2)#graphs
+library(ggsignif)#significance brackets
+
+mypal <- c("#264653", "#2A9D8F", "#E9C46A", "#F4A261", "#E76F51")
+
+```
+
+Read in data
+```{r}
+biomes <- vect("./data/Ecoregions2017/Ecoregions2017.shp")
+```
+
+list of all biome names
+```{r}
+unique(biomes$BIOME_NAME)
+```
+
+##Extract biomes
+
+Check biomes data for invalid geometries and then fix them
+```{r}
+is.valid(biomes) 
+
+biomes <- makeValid(biomes) #tends to be very slow
+
+is.valid(biomes) #check
+```
+
+save it so you don't have to reanalyse
+```{r}
+#writeVector(biomes, "./output/biomes_validated.shp")
+biomes <- vect("./output/biomes_validated.shp")
+```
+
+Load in other data
+```{r}
+data_main <- read.csv( "./output/data_main_final.csv")
+data_main <- data_main %>% filter(system == "t")
+
+data_main = vect(data_main, geom = c("location_lon", "location_lat"), crs = "epsg:4326")
+```
+
+
+Find what biome each point exists in
+```{r}
+temp <- terra::extract(biomes, data_main[5:7]) #test to see whether it will work, yes it does but quite slowly.
+```
+
+Now that we know it works, find the biome for the whole dataset (good luck)
+```{r}
+temp <- terra::extract(biomes, data_main)
+```
+
+And attach it onto the main dataset after removing the spatial vector aspect
+```{r}
+data_main <- as.data.frame(data_main)
+data_main <- data_main[, -1] #remove rownumber as column
+data_biomes <- bind_cols(data_main, temp)
+#write.csv(data_biomes, "./output_data_main_plusbiomes.csv", row.names = F)
+#data_biomes <- read_csv("./output_data_main_plusbiomes.csv")
+
+rm(temp, biomes)
+```
+
+Filter out records that don't focus on enemy damange and separate biogeographic and community studies
+```{r}
+
+data_biomes <- data_biomes %>% filter(response == "dmg")
+data_biomes_b <- data_biomes %>% filter(experiment_type == "b")
+data_biomes_c <- data_biomes %>% filter(experiment_type == "c")
+```
+
+
+
+##Analysis
+
+Run ANOVA to see if enemy release between different biomes is significant in comparison to enemy release within biomes.
+
+Some of the resources that helped me:
+https://cran.rstudio.com/web/packages/emmeans/vignettes/interactions.html
+https://people.math.ethz.ch/~meier/teaching/anova/random-and-mixed-effects-models.html#mixed-effects-models 
+
+Build base model
+```{r}
+lm_biomes_b <- lmer(erm ~ BIOME_NAME + (1|species_type2) + (1|source_filename), data = data_biomes_b)
+
+lm_biomes_c <- lmer(erm ~ BIOME_NAME + (1|species_type2) + (1|source_filename), data = data_biomes_c)
+```
+
+```{r}
+plot(lm_biomes_b)
+
+par(mfrow = c(1, 2))
+qqnorm(ranef(lm_biomes_b)$source_filename[,"(Intercept)"], 
+       main = "Random effects")
+qqnorm(resid(lm_biomes_b), main = "Residuals")
+```
+
+
+```{r}
+plot(lm_biomes_c)
+
+par(mfrow = c(1, 2))
+qqnorm(ranef(lm_biomes_c)$source_filename[,"(Intercept)"], 
+       main = "Random effects")
+qqnorm(resid(lm_biomes_c), main = "Residuals")
+```
+
+NOTE TO SELF: The residuals on the community model is a bit heavy...
+
+```{r}
+anova(lm_biomes_b, type = 2)
+anova(lm_biomes_c, type = 2)
+```
+Biogeographic enemy release did not differ between biomes.
+Community enemy release did not differ between biomes.
+
+Produce confidence intervals for each biome using emmeans (plus code to check for significant pairs if biomes had an effect)
+```{r}
+emmeans_biomes_b <- emmeans(object = lm_biomes_b, specs = "BIOME_NAME")
+emmeans_biomes_b
+emgraphdata_biomes_b <- summary(emmeans_biomes_b) #save info for graphs
+summary(pairs(emmeans_biomes_b)) #pairwise tests
+#pairwise_biomes_b <- pairwise_biomes_b %>% filter(p.value < 0.05) #keep only the significantly different pairs
+```
+
+```{r}
+emmeans_biomes_c <- emmeans(object = lm_biomes_c, specs = "BIOME_NAME")
+emmeans_biomes_c
+emgraphdata_biomes_c <- summary(emmeans_biomes_c) #save info for graphs
+summary(pairs(emmeans_biomes_c)) #pairwise tests
+#pairwise_biomes_c <- pairwise_biomes_c %>% filter(p.value < 0.05) #keep only the significantly different pairs
+```
+
+##Graph
+
+Reorder based on enemy release strength
+```{r}
+graphdata_biomes_b$BIOME_NAME <- reorder(graphdata_biomes_b$BIOME_NAME, graphdata_biomes_b$emmean) #list biomes by estimated marginal mean enemy release
+
+graphdata_biomes_c$BIOME_NAME <- reorder(graphdata_biomes_c$BIOME_NAME, graphdata_biomes_c$emmean)
+```
+
+
+
+```{r}
+graph_biomes_b <- data_biomes_b %>% 
+  filter(is.na(BIOME_NAME) == F) %>% 
+  ggplot(aes(x = erm, 
+             y = BIOME_NAME))+
+  geom_boxplot(alpha = 0.5, colour = mypal[2], fill = mypal[2])+
+  xlab("Enemy Release")+
+  ylab("Biome")+
+  theme_pubr()+
+  scale_y_discrete(
+    labels = c("Deserts &\nXeric Shrublands",
+               "Mediterranean Forests,\nWoodlands & Scrub",
+               "Montane Grasslands &\nShrublands",
+               "Temperate Broadleaf &\nMixed Forests",
+               "Temperate Conifer Forests",
+               "Temperate Grasslands,\n Savannas & Shrublands", 
+               "Tropical & Subtropical\nDry Broadleaf Forests",
+               "Tropical & Subtropical Grasslands,\nSavannas & Shrublands",
+               "Tropical & Subtropical\nMoist Broadleaf Forests"))
+
+graph_biomes_b
+```
+
+```{r}
+graph_biomes_c <- data_biomes_c %>% 
+  filter(is.na(BIOME_NAME) == F) %>% 
+  ggplot(aes(x = erm, 
+             y = BIOME_NAME))+
+  geom_boxplot(alpha = 0.5, colour = mypal[4], fill = mypal[4])+
+  xlab("Enemy Release")+
+  ylab("Biome")+
+  theme_pubr()+
+  scale_y_discrete(labels = c("Boreal Forests & Taigas",
+               "Deserts &\nXeric Shrublands",
+               "Temperate Grasslands,\n Savannas & Shrublands",
+               "Flooded Grasslands & Savannas",
+               "Mediterranean Forests,\nWoodlands & Scrub",
+               "Montane Grasslands &\nShrublands",
+               "Temperate Broadleaf &\nMixed Forests",
+               "Temperate Conifer Forests",
+               "Temperate Grasslands,\nSavannas & Shrublands",
+               "Tropical & Subtropical Grasslands,\nSavannas & Shrublands",
+               "Tropical & Subtropical\nMoist Broadleaf Forests"))
+
+graph_biomes_c
+```
+
+```{r}
+ggexport(graph_biomes_b, filename = "./output/ch3 figures/Figure2b.tiff",
+         res = 300, width = 2016, height = 1344)
+
+ggexport(graph_biomes_c, filename = "./output/ch3 figures/Figure2c.tiff",
+         res = 300, width = 2016, height = 1344*1.2)
+```
+
+##Alternate graphs for easier facets
+```{r}
+graph_biomes_b2 <- data_biomes %>% 
+  filter(is.na(BIOME_NAME) == F) %>% 
+  filter(experiment_type == "b") %>% 
+  ggplot(aes(x = erm, 
+             y = BIOME_NAME))+
+  geom_boxplot(alpha = 0.5, colour = mypal[2], fill = mypal[2])+
+  xlab("Enemy Release Metric\n")+
+  ylab("")+
+  theme_pubr()+
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey") +
+  scale_y_discrete(drop=FALSE,
+    labels = c("Temperate Conifer Forests",
+               "Tropical & Subtropical\nMoist Broadleaf Forests",
+               "Temperate Broadleaf\n& Mixed Forests",
+               "Boreal Forests/Taiga",
+               "Mediterranean Forests,\nWoodlands & Scrub",
+               "Deserts & Xeric Shrublands",
+               "Temperate Grasslands,\nSavannas & Shrublands",
+               "Flooded Grasslands\n& Savannas",
+               "Tropical & Subtropical\nGrasslands, Savannas\n& Shrublands",
+               "Montane Grasslands\n& Shrublands",
+               "Tropical & Subtropical\nDry Broadleaf Forests"),
+    limits = c("Temperate Conifer Forests",
+               "Tropical & Subtropical Moist Broadleaf Forests",
+               "Temperate Broadleaf & Mixed Forests",
+               "Boreal Forests/Taiga",
+               "Mediterranean Forests, Woodlands & Scrub",
+               "Deserts & Xeric Shrublands",
+               "Temperate Grasslands, Savannas & Shrublands",
+               "Flooded Grasslands & Savannas",
+               "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+               "Montane Grasslands & Shrublands",
+               "Tropical & Subtropical Dry Broadleaf Forests"))
+
+graph_biomes_b2
+
+graph_biomes_c2 <- data_biomes %>% 
+  filter(is.na(BIOME_NAME) == F) %>% 
+  filter(experiment_type == "c") %>% 
+  ggplot(aes(x = erm, 
+             y = BIOME_NAME))+
+  geom_boxplot(alpha = 0.5, colour = mypal[4], fill = mypal[4])+
+  xlab("Enemy Release Metric\n")+
+  ylab("")+
+  theme_pubr()+
+  geom_vline(xintercept = 0, linetype = "dotted", colour = "grey") +
+  scale_y_discrete(drop=FALSE,
+    labels = c("Temperate Conifer Forests",
+               "Tropical & Subtropical\nMoist Broadleaf Forests",
+               "Temperate Broadleaf\n& Mixed Forests",
+               "Boreal Forests/Taiga",
+               "Mediterranean Forests,\nWoodlands & Scrub",
+               "Deserts & Xeric Shrublands",
+               "Temperate Grasslands,\nSavannas & Shrublands",
+               "Flooded Grasslands\n& Savannas",
+               "Tropical & Subtropical\nGrasslands, Savannas\n& Shrublands",
+               "Montane Grasslands\n& Shrublands",
+               "Tropical & Subtropical\nDry Broadleaf Forests"),
+    limits = c("Temperate Conifer Forests",
+               "Tropical & Subtropical Moist Broadleaf Forests",
+               "Temperate Broadleaf & Mixed Forests",
+               "Boreal Forests/Taiga",
+               "Mediterranean Forests, Woodlands & Scrub",
+               "Deserts & Xeric Shrublands",
+               "Temperate Grasslands, Savannas & Shrublands",
+               "Flooded Grasslands & Savannas",
+               "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+               "Montane Grasslands & Shrublands",
+               "Tropical & Subtropical Dry Broadleaf Forests"))
+
+graph_biomes_c2
+```
+
+
+```{r}
+fig2 <- annotate_figure(ggarrange(graph_biomes_b2 + rremove("xlab"),
+                                 graph_biomes_c2+ rremove("xlab"), 
+                                 labels = c("a)", "b)")),
+                      bottom  = text_grob("Enemy Release Metric\n\n", face = "bold", size = 14)) 
+fig2
+```
+Export much wider and crop extra y axis in post
+```{r}
+ggexport(fig2, filename = "./output/ch3 figures/Figure2.tiff",
+         res = 300, width = 2016*1.5, height = 2016)
+```
+
+
+#Human Impact
+
+##Load Packages / Data
+```{r}
+library(tidyverse)
+library(terra)
+library(ggplot2)
+
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+
+mypal <- c("#264653", "#2A9D8F", "#E9C46A", "#F4A261", "#E76F51")
+
+```
+
+##data
+Obtained from https://doi.org/10.5061/dryad.052q5 with additional info from associated publication https://doi.org/10.1038/sdata.2016.67 
+```{r}
+HFP_raster <- terra::rast("data/v3-2009-human-footprint/wildareas-v3-2009-human-footprint.tif")
+
+HFP_raster <- project(HFP_raster, "epsg:4326")
+
+plot(HFP_raster)
+
+HFP_raster
+```
+load dataset
+```{r}
+data_main <- read.csv( "./output/data_main_final.csv")
+
+data_main <- data_main %>% filter(system == "t")
+
+data_main_spatial <- vect(data_main, geom = c("location_lon", "location_lat"), crs = "epsg:4326")
+```
+
+```{r}
+ggplot(data_main, aes(x = location_lon, y = location_lat, colour = ))+
+  geom_point()
+```
+
+##extract HFP
+```{r}
+hfp_df <- terra::extract(x = HFP_raster, y = data_main_spatial)
+hfp_df$`wildareas-v3-2009-human-footprint`
+data_main$hfp <- hfp_df$`wildareas-v3-2009-human-footprint` #double check this to make sure that the column is not in its own table
+```
+
+separate b and c (and exclude non terrestrial damage studies)
+```{r}
+data_hfp <- data_main %>% filter(system == "t") %>% filter(response == "dmg")
+
+data_b <- data_hfp %>% filter(experiment_type == "b")
+
+data_c <- data_hfp %>% filter(experiment_type == "c")
+```
+
+```{r}
+rm(data_main_spatial, hfp_df, HFP_raster)
+```
+
+##analysis
+
+```{r}
+data_b$species_type <- as_factor(data_b$species_type)
+data_b$source_filename <- as_factor(data_b$source_filename)#just in case
+
+lm_hfp_b <- lmer(erm ~ hfp + (1|species_type) + (1|source_filename), data = data_b)
+
+summary(lm_hfp_b)
+r.squaredGLMM(lm_hfp_b)
+
+```
+
+```{r}
+data_c$species_type <- as_factor(data_c$species_type)
+data_c$source_filename <- as_factor(data_c$source_filename)
+
+lm_hfp_c <- lmer(erm ~ hfp + (1|species_type) + (1|source_filename), data = data_c)
+
+summary(lm_hfp_c)
+r.squaredGLMM(lm_hfp_c)
+```
+
+##graph
+```{r}
+graph_hfp_b <- ggplot(data_b, aes(x = hfp, y = erm)) +
+  geom_point(colour = mypal[2], alpha = 0.5)+
+#    geom_segment(x = , y = , xend = , yend = ),
+#                 colour = mypal[3], linewidth = 1) + #trendline
+  theme_pubr()+
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6), 
+                     limits = c(-4.2,7))+
+  scale_x_continuous(name = "Human Footprint Index", 
+                     breaks = c(0, 50, 100, 150), 
+                     limits = c(0, 150)) +
+  theme(axis.title.x = element_text(face = "bold"))
+
+graph_hfp_b
+```
+
+```{r}
+graph_hfp_c <- ggplot(data_c, aes(x = hfp, y = erm)) +
+  geom_point(colour = mypal[4], alpha = 0.5)+
+#    geom_segment(x = , y = , xend = , yend = ),
+#                 colour = mypal[3], linewidth = 1) + #trendline
+  theme_pubr()+
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6), 
+                     limits = c(-4.2,7))+
+  scale_x_continuous(name = "Human Footprint Index", 
+                     breaks = c(0, 50, 100, 150), 
+                     limits = c(0, 150)) +
+  theme(axis.title.x = element_text(face = "bold"))
+
+graph_hfp_c
+```
+
+```{r}
+fig3 <- annotate_figure(ggarrange(graph_hfp_b+ rremove("ylab"),
+                                 graph_hfp_c + rremove("ylab"), 
+                                 labels = c("a)", "b)"), hjust = 0.5),
+                       left = text_grob("Enemy Release Metric\n", rot = 90, face = "bold", size = 14)) 
+fig3
+```
+
+
+```{r}
+ggexport(fig3, filename = "./output/ch3 figures/Figure3.tiff",
+         res = 300, width = 2016, height = 2016*(2/3))
+```
+
+#Number of Congeners/Confamillials & Time Since Introduction
+##Load Packages / Data
+```{r}
+library(rgbif) #gbif
+library(usethis) #package to help set environment
+library(rnaturalearth) #country borders etc.
+
+library(easystats)
+
+library(terra)
+library(tidyverse)
+
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+```
+
+data
+```{r}
+data_main <- read_csv( "./output/data_main_final.csv")
+```
+
+##Obtain Geographical Information
+```{r}
+countries <- vect(ne_countries(type = "map_units", scale = "small")) #download countries map
+
+data_vector <- vect(data_main, geom = c("location_lon", "location_lat"), crs = "epsg:4326")
+data_vector <- terra::extract(countries, y = data_vector) #extract country from coords
+
+data_main$country_name <- data_vector$geounit #add country
+data_main$country_iso2 <- data_vector$iso_a2 #add 2 letter ISO code
+
+rm(data_vector, countries)
+```
+
+NOTE: If you are running this for the first time and wish to access the data yourself, you'll have to create an environ file with your own GBIF account details
+
+##Obtain GBIF taxa codes
+```{r}
+gbif_checklist <- name_backbone_checklist(data_main$study_species)
+
+temp <- gbif_checklist %>% filter(!matchType %in% c("EXACT") | !rank == "SPECIES") 
+#show all the non-exact matches
+```
+
+manually change the ones that were not matched properly
+```{r}
+data_main$match_species <- data_main$study_species #new col for matched name
+
+data_main$match_species[156] <- "Acer platanoides" #was subsp
+data_main$match_species[159] <- "Acalypha wilkesiana"
+data_main$match_species[166] <- "Eugenia cerasiflora" #(Kiaersk.) from source
+data_main$match_species[186:188] <- "Calamagrostis arenaria"
+data_main$match_species[207:213] <- "Calamagrostis arenaria"
+data_main$match_species[235] <- "Lonicera xylosteum"
+data_main$match_species[322:326] <- "Mus musculus" #was subsp
+data_main$match_species[347] <- "Fallopia japonica"
+data_main$match_species[349] <- "NA" #too vague
+data_main$match_species[351] <- "NA" #too vague
+data_main$match_species[363] <- "Osteospermum moniliferum" #subsp and also new syn
+data_main$match_species[564] <- "NA" #cannot determine which synonym to use
+data_main$match_species[568] <- "Erythranthe guttata"
+data_main$match_species[583] <- "NA" #cannot determine which synonym to use
+
+gbif_checklist <- name_backbone_checklist(data_main$match_species) #match again
+```
+
+check and append final species key
+```{r}
+data_main$speciesKey <- gbif_checklist$usageKey #append gbif species key
+data_main$match_species <- gbif_checklist$species #and accepted species name
+data_main$familyKey <- gbif_checklist$familyKey #and family key
+data_main$genusKey <- gbif_checklist$genusKey #and genus key
+
+rm(gbif_checklist)
+```
+
+##Create search function
+Write function that searches for number of species of each higher taxa in country (and buffer range?)
+```{r}
+n_conx_species <- function(taxonKey,
+                           country_iso2,
+                                decimal_Longitude = NA,
+                                decimal_Latitude = NA,
+                                bufferwidth = 30000) {
+  if (is.na(taxonKey)) {
+    print("invalid taxa")
+    return(NA)
+  } else if (is.na(country_iso2)) {
+    print("invalid country")
+    return(NA)
+  } else {
+  output = nrow(occ_count(facet = 'speciesKey', 
+                          facetLimit = 25000, #the most abundant plant family has under 25k species worldwide so this should cover most cases
+                          taxonKey = taxonKey, 
+                          country = country_iso2))
+  if (output == 25000) {print("warning: oversized taxa, check if taxonKey is correct")}
+  return(output)
+    }
+}
+```
+
+(and buffer range?)
+```{r}
+n_conx_species_dist <- function(taxonKey,
+                                decimal_Longitude = NA,
+                                decimal_Latitude = NA,
+                                bufferwidth = 30000) {
+  if (is.na(taxonKey)) {
+    print("invalid taxa")
+    return(NA)
+  } else if (is.na(decimal_Longitude) |is.na(decimal_Latitude)) {
+    print("invalid coordinates")
+    return(NA)
+  } else {
+    
+    geometry <- vect(x = cbind(decimalLongitude, 
+                               decimalLatitude), 
+                     crs = "epsg:4326") 
+    
+    geometry <- geom(buffer(x = geometry,
+                            width = bufferwidth),
+                     wkt = T) 
+    
+    output = nrow(occ_count(facet = 'speciesKey', 
+                            facetLimit = 25000, #the most abundant plant family has under 25k species worldwide so this should cover most cases
+                            taxonKey = taxonKey, 
+                            geometry = geometry,
+                            occurrenceStatus = PRESENT))
+    if (output == 25000) {print("warning: oversized taxa, check if taxonKey is correct")}
+    return(output)
+  }
+}
+```
+
+##Run search function
+```{r}
+data_main$n_congener <- mapply(n_conx_species, taxonKey = data_main$genusKey, country_iso2 = data_main$country_iso2)
+
+Sys.sleep(10) #wait 10 seconds before running for family
+
+data_main$n_confamillial <- mapply(n_conx_species, taxonKey = data_main$familyKey, country_iso2 = data_main$country_iso2)
+```
+
+Correct for the 1 species which is the target species
+
+make changes on a temp just in case
+```{r}
+data_main$n_congener[data_main$n_congener == "0"] <- NA #NA if species isn't found in the area
+data_main$n_congener <- data_main$n_congener - 1 #remove initial species from count
+
+data_main$n_confamillial[data_main$n_confamillial == "0"] <- NA #NA if species isn't found in the area
+data_main$n_confamillial <- data_main$n_confamillial - 1 #remove initial species from count
+```
+
+save data in case of crashes
+```{r}
+#write.csv(data_main, "./output/data_main_conX.csv", row.names = F)
+#data_main <- read.csv("./output/data_main_conX.csv")
+```
+
+
+##Last minute filters
+
+```{r}
+data_main <- data_main %>% filter(system == "t") %>% filter(response == "dmg")
+```
+
+
+##Analysis
+```{r}
+#how many introductions have congeneric species within the country of record?
+table(data_main$n_congener > 0)
+
+#how many introductions have confamillial species within the country of record?
+table(data_main$n_confamillial> 0)
+
+data_main %>%
+ggplot() +
+  geom_point(aes(x = n_congener, y = erm, colour = as.factor(genusKey), shape =))+
+  scale_x_log10()+
+  theme_classic() +
+  theme(legend.position = "none")
+
+data_main %>% filter(experiment_type == "b") %>%
+ggplot() +
+  geom_point(aes(x = (n_congener), y = erm, colour = as.factor(genusKey), shape =))+
+  scale_x_log10()+
+  theme_classic() +
+  theme(legend.position = "none")
+
+data_main %>% filter(experiment_type == "c") %>%
+ggplot() +
+  geom_point(aes(x = (n_congener), y = erm, colour = as.factor(genusKey), shape =))+
+  scale_x_log10()+
+  theme_classic() +
+  theme(legend.position = "none")
+
+data_main %>% filter(experiment_type == "b") %>%
+ggplot() +
+  geom_point(aes(x = (n_confamillial), y = erm, colour = as.factor(familyKey)))+
+  scale_x_log10()+
+  theme_classic() +
+  theme(legend.position = "none")
+
+data_main %>% filter(experiment_type == "c") %>%
+ggplot() +
+  geom_point(aes(x = (n_confamillial), y = erm, colour = as.factor(familyKey)))+
+  scale_x_log10()+
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+We have 525 records of congeners and 555 records of confamillials before filtering, but 350 records of congeners and 366 records of confamillials after excluding non-damage and aquatics
+
+```{r}
+data_congener <- data_main %>% filter(!is.na(n_congener))
+
+data_confamillial <- data_main %>% filter(!is.na(n_confamillial))
+```
+
+```{r}
+lm_congener_b <- lmer(erm ~ log10(n_congener+0.5) + (1|species_type)+ (1|source_filename), data = data_congener[data_congener$experiment_type == "b",])
+
+summary(lm_congener_b)
+```
+
+```{r}
+lm_comparison <- lmer(erm ~ log10(n_congener+0.5) + (1|source_filename), data = data_congener[data_congener$experiment_type == "b",])
+
+summary(lm_comparison) #confirm that the singularity is just the random effects
+```
+
+
+```{r}
+summary(lm_congener_b)
+check_model(lm_congener_b)
+check_normality(lm_congener_b)
+```
+
+
+```{r}
+lm_congener_c <- lmer(erm~log10(n_congener + 0.5) + (1|species_type)+ (1|source_filename), data = data_congener[data_congener$experiment_type == "c",])
+
+summary(lm_congener_c)
+```
+
+```{r}
+check_model(lm_congener_c)
+```
+
+
+```{r}
+lm_confamillial_b <- lmer(erm~log10(n_confamillial + 0.5) + (1|species_type)+ (1|source_filename), data = data_confamillial[data_confamillial$experiment_type == "b",])
+
+summary(lm_confamillial_b)
+```
+
+```{r}
+check_model(lm_confamillial_b)
+```
+
+
+```{r}
+lm_confamillial_c <- lmer(erm~log10(n_confamillial + 0.5) + (1|species_type)+ (1|source_filename), data = data_confamillial[data_confamillial$experiment_type == "c",])
+summary(lm_confamillial_c)
+```
+
+
+```{r}
+check_model(lm_confamillial_c)
+```
+
+##graph
+
+```{r}
+graph_congener_b <- data_congener%>% filter(experiment_type == "b") %>%
+ggplot() +
+  geom_point(aes(x = log10(n_congener + 0.5), y = erm), colour = mypal[2], alpha = 0.5)+
+  scale_x_continuous(name = "Number of congeneric species",
+                     breaks = c(log10(0 + 0.5), log10(1 + 0.5), 
+                                log10(10 + 0.5), log10(100 + 0.5), 
+                                log10(1000 + 0.5), log10(10000 + 0.5)),
+                     labels = c(0, 1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6, 8), 
+                     limits = c(-5,8.5))+
+  theme_pubr()
+graph_congener_b
+```
+
+```{r}
+graph_congener_c<- data_congener%>% filter(experiment_type == "c") %>%
+ggplot() +
+  geom_point(aes(x = log10(n_congener + 0.5), y = erm), colour = mypal[4], alpha = 0.5)+
+  scale_x_continuous(name = "Number of congeneric species",
+                     breaks = c(log10(0 + 0.5), log10(1 + 0.5), 
+                                log10(10 + 0.5), log10(100 + 0.5), 
+                                log10(1000 + 0.5), log10(10000 + 0.5)),
+                     labels = c(0, 1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6, 8), 
+                     limits = c(-5,8.5))+
+  theme_pubr()
+graph_congener_c
+```
+
+```{r}
+graph_confamillial_b <- data_confamillial%>% filter(experiment_type == "b") %>%
+ggplot() +
+  geom_point(aes(x = log10(n_confamillial + 0.5), y = erm), colour = mypal[2], alpha = 0.5)+
+  scale_x_continuous(name = "Number of confamillial species",
+                     breaks = c(log10(0 + 0.5), log10(1 + 0.5), 
+                                log10(10 + 0.5), log10(100 + 0.5), 
+                                log10(1000 + 0.5), log10(10000 + 0.5)),
+                     labels = c(0, 1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6, 8), 
+                     limits = c(-5,8))+
+  theme_pubr()
+graph_confamillial_b
+```
+
+```{r}
+graph_confamillial_c <- data_confamillial%>% filter(experiment_type == "c") %>%
+ggplot() +
+  geom_point(aes(x = log10(n_confamillial + 0.5), y = erm), colour = mypal[4], alpha = 0.5)+
+  scale_x_continuous(name = "Number of confamillial species",
+                     breaks = c(log10(0 + 0.5), log10(1 + 0.5), 
+                                log10(10 + 0.5), log10(100 + 0.5), 
+                                log10(1000 + 0.5), log10(10000 + 0.5)),
+                     labels = c(0, 1, 10, 100, 1000, 10000)) +
+  scale_y_continuous(name = "Enemy Release Metric",
+                     breaks = c(-4, -2, 0, 2, 4, 6, 8), 
+                     limits = c(-5,8))+
+  theme_pubr()
+graph_confamillial_c
+```
+
+```{r}
+figure4<- annotate_figure(ggarrange(graph_congener_b + rremove("ylab"),
+                                    graph_congener_c + rremove("ylab"),
+                                    graph_confamillial_b + rremove("ylab"),
+                                 graph_confamillial_c + rremove("ylab"), 
+                                 labels = c("a)", "b)", "c)", "d)"), hjust = 0.5),
+                       left = text_grob("Enemy Release Metric\n", rot = 90, face = "bold", size = 14),
+                       right = text_grob("   ", rot = 90)) #blank text on right to create border 
+
+figure4
+```
+
+```{r}
+ggexport(figure4, filename = "./output/ch3 figures/Figure4.tiff",
+         res = 300, width = 2016, height = 2016)
+```
+
+##Optional Exploration  
+There is a slight normality issue with the congeners and biogeographic enemy release model.
+
+Look into different transformations
+```{r}
+model_lm_basic <- lm(erm~n_congener, data = data_b)
+
+library(easystats)
+check_distribution(model_lm_basic) %>% plot()
+
+check_distribution(model_lm_basic)
+
+
+lm_ <- glm(erm ~ n_congener, 
+                    data = data_congener,
+                    subset = data_congener$experiment_type == "b",
+                    family = )#normal dist
+
+summary(lm_congener_b)
+
+plot(lm_congener_b)
+
+```
+
+
